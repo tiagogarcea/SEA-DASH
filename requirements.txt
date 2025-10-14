@@ -1,0 +1,8 @@
+# requirements.txt
+dash
+pandas
+numpy
+dash-bootstrap-components
+plotly
+gunicorn  # Servidor de produção para Python
+pyarrow   # Para ler arquivos parquet
