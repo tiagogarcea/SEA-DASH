@@ -7,3 +7,5 @@ plotly
 gunicorn  # Servidor de produção para Python
 pyarrow   # Para ler arquivos parquet
 requests
+Werkzeug
+psycopg2-binary
