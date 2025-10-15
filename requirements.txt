@@ -9,3 +9,4 @@ pyarrow   # Para ler arquivos parquet
 requests
 Werkzeug
 psycopg2-binary
+python-dotenv
