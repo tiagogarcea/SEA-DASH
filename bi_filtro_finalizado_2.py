@@ -1,5 +1,5 @@
 # ==============================================================================
-# 1. IMPORTAÇÃO DAS BIBLIOTECAS
+# 1. IMPORTAÇÃO DAS BIBLIOTECAS (COM ADIÇÕES)
 # ==============================================================================
 import dash
 from dash import dcc, html, Input, Output, State, ALL, clientside_callback, ctx, callback, no_update
@@ -7,15 +7,93 @@ import plotly.express as px
 import pandas as pd
 import numpy as np
 import dash_bootstrap_components as dbc
-import socket
 import urllib.parse
 import math
 import os
 from datetime import datetime
 import plotly.graph_objects as go
+import flask  # Para obter o IP do usuário
+import requests  # Para geolocalização
+
+# --- MÓDULOS DE AUTENTICAÇÃO E BANCO DE DADOS ---
+import sqlite3
+from werkzeug.security import generate_password_hash, check_password_hash
 
 # ==============================================================================
-# 2. FUNÇÃO PARA GERAR O DATAFRAME COMPARATIVO (VERSÃO ROBUSTA E CORRIGIDA)
+# CONFIGURAÇÕES DE AUTENTICAÇÃO
+# ==============================================================================
+DB_FILE = 'users_logs.db'
+ADMIN_USERS = ['tgr', 'lfdl']
+NORMAL_USERS = ['hmc', 'hes', 'jbg', 'anln', 'tcj', 'cmf', 'mss']
+ALL_PREDEFINED_USERS = ADMIN_USERS + NORMAL_USERS
+
+# ==============================================================================
+# FUNÇÕES DO BANCO DE DADOS
+# ==============================================================================
+def get_user(username):
+    """Busca um usuário no banco de dados."""
+    db_path = os.path.join(os.path.dirname(__file__), DB_FILE)
+    if not os.path.exists(db_path):
+        print(f"ERRO: Arquivo de banco de dados '{DB_FILE}' não encontrado.")
+        return None
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    user = conn.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
+    conn.close()
+    return user
+
+def update_user_password(username, password):
+    """Atualiza a senha de um usuário (gerando hash)."""
+    password_hash = generate_password_hash(password)
+    db_path = os.path.join(os.path.dirname(__file__), DB_FILE)
+    conn = sqlite3.connect(db_path)
+    conn.execute('UPDATE users SET password_hash = ? WHERE username = ?', (password_hash, username))
+    conn.commit()
+    conn.close()
+
+def log_access(username):
+    """Registra um evento de login no banco de dados."""
+    try:
+        ip_address = flask.request.headers.get('X-Forwarded-For', flask.request.remote_addr)
+        response = requests.get(f'http://ip-api.com/json/{ip_address}?fields=city,regionName,country', timeout=2)
+        if response.status_code == 200:
+            data = response.json()
+            location = f"{data.get('city', 'N/A')}, {data.get('regionName', 'N/A')}, {data.get('country', 'N/A')}"
+        else:
+            location = "Localização não encontrada"
+    except requests.exceptions.RequestException:
+        ip_address = "N/A"
+        location = "Falha ao obter localização"
+    except Exception:
+        ip_address = "localhost"
+        location = "Local"
+
+    db_path = os.path.join(os.path.dirname(__file__), DB_FILE)
+    conn = sqlite3.connect(db_path)
+    conn.execute('INSERT INTO access_logs (username, ip_address, location) VALUES (?, ?, ?)',
+                 (username, ip_address, location))
+    conn.commit()
+    conn.close()
+
+def get_all_logs():
+    """Busca todos os registros de logs de acesso."""
+    db_path = os.path.join(os.path.dirname(__file__), DB_FILE)
+    conn = sqlite3.connect(db_path)
+    query = """
+    SELECT
+        timestamp AS "HORA DO ACESSO",
+        username AS "LOGIN",
+        ip_address AS "IP DO COMPUTADOR",
+        location AS "LOCALIZAÇÃO"
+    FROM access_logs
+    ORDER BY timestamp DESC
+    """
+    df_logs = pd.read_sql_query(query, conn)
+    conn.close()
+    return df_logs
+
+# ==============================================================================
+# 2. FUNÇÃO PARA GERAR O DATAFRAME COMPARATIVO (SEU CÓDIGO ORIGINAL)
 # ==============================================================================
 def gerar_df_comparativo_robusto(df_base):
     """
@@ -49,27 +127,20 @@ def gerar_df_comparativo_robusto(df_base):
         plano_recente = planos[0]
         plano_anterior = planos[1]
 
-        # Filtra o DF base para a localidade e os dois planos relevantes
         df_local = df[(df['localidade'] == localidade) & (df['plano'].isin(planos))]
 
-        # Acha o preço MÍNIMO para cada grupo (categoria, retirada, etc.)
-        idx_min = df_local.groupby(['plano', 'retirada', 'duração', 'categoria'])['preço'].idxmin()
-        df_mais_baratos = df_local.loc[idx_min]
+        try:
+            idx_min = df_local.groupby(['plano', 'retirada', 'duração', 'categoria'])['preço'].idxmin()
+            df_mais_baratos = df_local.loc[idx_min]
+        except ValueError:
+            continue
 
-        # Separa os dados do plano recente e do anterior
         df_recente = df_mais_baratos[df_mais_baratos['plano'] == plano_recente]
         df_anterior = df_mais_baratos[df_mais_baratos['plano'] == plano_anterior]
 
-        # Colunas para fazer a junção (o que define um "carro" para comparação)
         merge_cols = ['localidade', 'retirada', 'duração', 'categoria']
 
-        # Junta os dois dataframes para ter os preços lado a lado
-        df_merged = pd.merge(
-            df_recente,
-            df_anterior,
-            on=merge_cols,
-            suffixes=('_atual', '_anterior')
-        )
+        df_merged = pd.merge(df_recente, df_anterior, on=merge_cols, suffixes=('_atual', '_anterior'))
 
         if not df_merged.empty:
             lista_dfs_comparados.append(df_merged)
@@ -84,7 +155,6 @@ def gerar_df_comparativo_robusto(df_base):
     # --- 2.5. Calcular a variação e formatar ---
     df_final['variacao_preco'] = (df_final['preço_atual'] / df_final['preço_anterior']) - 1
 
-    # Renomear colunas para o relatório final
     novos_nomes = {
         'localidade': 'LOCALIDADE', 'retirada': 'RETIRADA', 'duração': 'DURAÇÃO', 'categoria': 'CATEGORIA',
         'preço_anterior': 'PREÇO ANTERIOR', 'preço_atual': 'PREÇO ATUAL',
@@ -105,20 +175,19 @@ def gerar_df_comparativo_robusto(df_base):
     colunas_finais = ['LOCALIDADE', 'RETIRADA', 'DURAÇÃO', 'CATEGORIA', 'PREÇO ANTERIOR', 'PREÇO ATUAL', 'VARIAÇÃO %',
                       'LOCADORA MAIS BARATA (ANTERIOR)', 'LOCADORA MAIS BARATA (ATUAL)', 'PLANO ANTERIOR', 'PLANO ATUAL']
 
-    # Garante que apenas as colunas finais existam e estejam na ordem correta
-    df_relatorio_final = df_relatorio_final[colunas_finais]
+    df_relatorio_final = df_relatorio_final[[col for col in colunas_finais if col in df_relatorio_final.columns]]
 
     print(f"Análise comparativa concluída! {len(df_relatorio_final)} variações encontradas em múltiplas localidades.")
     return df_relatorio_final
 
 # ==============================================================================
-# 3. CARREGAMENTO E LIMPEZA DOS DADOS
+# 3. CARREGAMENTO E LIMPEZA DOS DADOS (SEU CÓDIGO ORIGINAL)
 # ==============================================================================
 last_update_string = "N/A"
 df_comparativo = pd.DataFrame()
+plano_recente = "N/A"
 
 try:
-    # --- CÓDIGO MODIFICADO ---
     script_dir = os.path.dirname(__file__)
     caminho_arquivo = os.path.join(script_dir, 'dados_consolidados.parquet')
     df_original = pd.read_parquet(caminho_arquivo)
@@ -131,24 +200,19 @@ try:
     print(f"Total de {len(df_original)} linhas carregadas.")
     print(f"Última modificação do arquivo: {last_update_string}")
 
-    # Gera o DataFrame comparativo a partir de uma cópia com colunas minúsculas
     df_para_comparativo = df_original.copy()
     df_para_comparativo.columns = [str(col).lower() for col in df_para_comparativo.columns]
     df_comparativo = gerar_df_comparativo_robusto(df_para_comparativo)
 
-    # Continua o tratamento normal com 'df' usando colunas maiúsculas
     df = df_original.copy()
     df.columns = [str(col).upper() for col in df.columns]
-
-    # ### LINHA CORRETIVA ADICIONADA ###
-    # Garante que o DataFrame principal não tenha colunas duplicadas
     df = df.loc[:, ~df.columns.duplicated()]
 
-    plano_recente = df_comparativo['PLANO ATUAL']
-    plano_recente = plano_recente.tolist()
-    plano_recente = plano_recente[0]
-    plano_recente = f'{plano_recente}'
-    print(plano_recente)
+    if not df_comparativo.empty and 'PLANO ATUAL' in df_comparativo.columns:
+        plano_recente_series = df_comparativo['PLANO ATUAL']
+        if not plano_recente_series.empty:
+            plano_recente = str(plano_recente_series.iloc[0])
+            print(f"Plano mais recente detectado: {plano_recente}")
 
 except FileNotFoundError:
     print(f"ERRO: O arquivo '{caminho_arquivo}' não foi encontrado.")
@@ -164,10 +228,10 @@ if not df.empty:
     if 'PREÇO' in df.columns and pd.api.types.is_object_dtype(df['PREÇO']):
         df['PREÇO'] = pd.to_numeric(df['PREÇO'], errors='coerce')
 
-    # Renomeando 'DATA' para 'DATA_HORA' para evitar conflito com .dt.date
     df.rename(columns={'DATA': 'DATA_HORA'}, inplace=True)
     df['DATA_HORA'] = pd.to_datetime(df['DATA_HORA'], errors='coerce')
-    df['DATA_HORA'] = pd.to_datetime(df['DATA_HORA'].dt.date.astype(str) + ' ' + df['HORA'].astype(str), errors='coerce')
+    if 'HORA' in df.columns:
+        df['DATA_HORA'] = pd.to_datetime(df['DATA_HORA'].dt.date.astype(str) + ' ' + df['HORA'].astype(str), errors='coerce')
 
     if 'RETIRADA' in df.columns:
         df['RETIRADA'] = pd.to_datetime(df['RETIRADA'], errors='coerce')
@@ -178,7 +242,6 @@ if not df.empty:
     df_calculos['RETIRADA'] = df_calculos['RETIRADA'].dt.date
 
     df_tabela = df.copy()
-    # Renomeia DATA_HORA de volta para DATA para exibição na tabela
     df_tabela.rename(columns={'DATA_HORA': 'DATA'}, inplace=True)
     for col in df_tabela.columns:
         if pd.api.types.is_datetime64_any_dtype(df_tabela[col]):
@@ -189,19 +252,14 @@ if not df.empty:
     print(f"Total de {len(df)} linhas após a limpeza.")
 else:
     print("Dashboard iniciado com dados de exemplo.")
-    df = pd.DataFrame({
-        'LOCALIDADE': ['N/A'], 'RETIRADA': [pd.to_datetime('2025-09-26')], 'CRIAÇÃO': [None], 'LOR': [0],
-        'MODELO': ['Erro ao carregar'], 'PREÇO': [0], 'LOCADORA': ['N/A'], 'PLANO': ['N/A'],
-        'HORA': ['00:00:00'], 'OTA': ['N/A'], 'CAMBIO': ['N/A'], 'CATEGORIA': ['N/A'], 'DATA_HORA': [pd.to_datetime('2025-09-26')]
-    })
+    cols = ['LOCALIDADE', 'RETIRADA', 'CRIAÇÃO', 'DURAÇÃO', 'MODELO', 'PREÇO', 'LOCADORA', 'PLANO', 'HORA', 'OTA', 'CAMBIO', 'CATEGORIA', 'DATA_HORA']
+    df = pd.DataFrame(columns=cols).astype({'RETIRADA': 'datetime64[ns]', 'DATA_HORA': 'datetime64[ns]'})
     df_calculos = df.copy()
     df_tabela = df.copy()
     df_tabela.rename(columns={'DATA_HORA': 'DATA'}, inplace=True)
-    df_tabela['RETIRADA'] = df_tabela['RETIRADA'].dt.strftime('%Y-%m-%d')
-    df_tabela['DATA'] = df_tabela['DATA'].dt.strftime('%Y-%m-%d %H:%M:%S')
 
 # ==============================================================================
-# 4. INICIALIZAÇÃO E ESTILO DO APP
+# 4. INICIALIZAÇÃO E ESTILO DO APP (SEU CÓDIGO ORIGINAL)
 # ==============================================================================
 CUSTOM_CSS = """
     body, .dash-bootstrap { background-color: #2b2b2b !important; color: #f0f0f0 !important; font-family: 'Segoe UI', sans-serif !important; font-size: 10pt; }
@@ -236,35 +294,110 @@ PAGE_SIZE = 20
 INITIAL_SCALE = 0.8
 INVERSE_WIDTH = (1 / INITIAL_SCALE) * 100
 
-SIDEBAR_STYLE = { "position": "fixed", "top": 0, "left": 0, "bottom": 0, "width": "18rem", "padding": "2rem 1rem", "background-color": "#2b2b2b", "border-right": "1px solid #444" }
-CONTENT_STYLE = { "marginLeft": "18rem", "padding": "2rem 1rem", "transform": f"scale({INITIAL_SCALE})", "transformOrigin": "top left", }
+# --- LAYOUTS DE LOGIN E REGISTRO (NOVOS) ---
+login_layout = dbc.Container([
+    dbc.Row(
+        dbc.Col(
+            html.Div([
+                dbc.Card([
+                    dbc.CardBody([
+                        html.H3("Login", className="card-title text-center"),
+                        html.Div(id='login-alert', className="mb-2"),
+                        dbc.Input(id="login-username", type="text", placeholder="Usuário", className="mb-3", autoFocus=True),
+                        dbc.Input(id="login-password", type="password", placeholder="Senha", className="mb-3"),
+                        dbc.Button("Entrar", id="login-button", color="primary", className="w-100"),
+                        html.Div(
+                            dcc.Link("Primeiro login?", href="/register", style={'font-style': 'italic', 'color': 'lightblue'}),
+                            className="text-center mt-3"
+                        )
+                    ])
+                ])
+            ], className="w-100", style={'maxWidth': '400px'}),
+            width="auto"
+        ),
+        className="vh-100 d-flex align-items-center justify-content-center"
+    )
+], fluid=True, style={"backgroundColor": "#2b2b2b", "height": "100vh"})
 
-sidebar = html.Div([
-    html.H2("SEA-DASH", className="display-6"), html.Hr(),
-    dbc.Nav([
+register_layout = dbc.Container([
+    dbc.Row(
+        dbc.Col(
+            html.Div([
+                dbc.Card([
+                    dbc.CardBody([
+                        html.H3("Primeiro Acesso", className="card-title text-center"),
+                        html.P("Cadastre sua senha.", className="text-center text-muted"),
+                        html.Div(id='register-alert', className="mb-2"),
+                        dbc.Input(id="register-username", type="text", placeholder="Seu login predefinido", className="mb-3", autoFocus=True),
+                        dbc.Input(id="register-password", type="password", placeholder="Crie uma senha", className="mb-3"),
+                        dbc.Input(id="register-confirm-password", type="password", placeholder="Confirme a senha", className="mb-3"),
+                        dbc.Button("Confirmar", id="register-button", color="success", className="w-100"),
+                         html.Div(
+                            dcc.Link("Voltar para o Login", href="/login", style={'font-style': 'italic', 'color': 'lightblue'}),
+                            className="text-center mt-3"
+                        )
+                    ])
+                ])
+            ], className="w-100", style={'maxWidth': '400px'}),
+            width="auto"
+        ),
+        className="vh-100 d-flex align-items-center justify-content-center"
+    )
+], fluid=True, style={"backgroundColor": "#2b2b2b", "height": "100vh"})
+
+
+# --- LAYOUT DA ABA DE LOGS (ADMIN - NOVO) ---
+layout_admin_logs = dbc.Container([
+    html.H1("Logs de Acesso", className="text-center text-primary mb-4"),
+    html.P("Registros de login no sistema."),
+    html.Hr(),
+    dcc.Loading(
+        id="loading-logs",
+        type="circle",
+        children=[
+             html.Div(id='log-table-container', style={'overflowX': 'auto'})
+        ]
+    )
+], fluid=True)
+
+# --- SIDEBAR DINÂMICA (NOVA) ---
+def create_sidebar(user_role):
+    SIDEBAR_STYLE = { "position": "fixed", "top": 0, "left": 0, "bottom": 0, "width": "18rem", "padding": "2rem 1rem", "background-color": "#2b2b2b", "border-right": "1px solid #444" }
+
+    nav_links = [
         dbc.NavLink("Base", href="/", active="exact"),
         dbc.NavLink("Comparativo", href="/comparativo", active="exact"),
         dbc.NavLink("Big Picture", href="/dashboard", active="exact"),
         dbc.NavLink("Posicionamento por Loja", href="/posicionamento", active="exact"),
         dbc.NavLink("Posicionamento por Categoria", href="/posicionamento-categoria", active="exact"),
         dbc.NavLink("Movimentação Horário", href="/movimentacao-horario", active="exact"),
-    ], vertical=True, pills=True),
-    html.Div([
-        html.Hr(),
-        html.P("Controles", style={'textAlign': 'center', 'fontWeight':'bold'}),
-        dbc.Button("Recarregar Dados 🔄", href="/", color="success", className="w-100 mb-2"),
-        dbc.ButtonGroup([
-            dbc.Button('-', id='zoom-out-btn', color='primary'),
-            dbc.Button('Reset', id='zoom-reset-btn', color='secondary'),
-            dbc.Button('+', id='zoom-in-btn', color='primary')
-        ], size="sm", className="d-flex"),
-        html.Small(
-            f"Última Atualização: {last_update_string}",
-            style={'color': '#999', 'fontSize': '0.75rem', 'display': 'block', 'textAlign': 'center', 'marginTop': '10px'}
-        )
-    ], style={'position': 'absolute', 'bottom': '1rem', 'width': 'calc(100% - 2rem)'})
-], style=SIDEBAR_STYLE)
+    ]
+    if user_role == 'admin':
+        nav_links.append(dbc.NavLink("Logs de Acesso", href="/admin-logs", active="exact", className="text-warning font-weight-bold"))
 
+    sidebar = html.Div([
+        html.H2("SEA-DASH", className="display-6"), html.Hr(),
+        dbc.Nav(nav_links, vertical=True, pills=True),
+        html.Div([
+            html.Hr(),
+            html.P("Controles", style={'textAlign': 'center', 'fontWeight':'bold'}),
+            dbc.Button("Recarregar Dados 🔄", href="/", color="success", className="w-100 mb-2"),
+            dbc.ButtonGroup([
+                dbc.Button('-', id='zoom-out-btn', color='primary'),
+                dbc.Button('Reset', id='zoom-reset-btn', color='secondary'),
+                dbc.Button('+', id='zoom-in-btn', color='primary')
+            ], size="sm", className="d-flex"),
+            dbc.Button("Logout", id="logout-button", color="danger", className="w-100 mt-3"),
+            html.Small(
+                f"Última Atualização: {last_update_string}",
+                style={'color': '#999', 'fontSize': '0.75rem', 'display': 'block', 'textAlign': 'center', 'marginTop': '10px'}
+            )
+        ], style={'position': 'absolute', 'bottom': '1rem', 'width': 'calc(100% - 2rem)'})
+    ], style=SIDEBAR_STYLE)
+    return sidebar
+
+
+# --- SEUS LAYOUTS ORIGINAIS (INTACTOS) ---
 def criar_cabecalho_de_filtros(df_para_filtros, page_prefix):
     if df_para_filtros.empty:
         return html.Thead(html.Tr(html.Th("Nenhum dado para exibir.")))
@@ -305,7 +438,6 @@ layout_visao_geral = dbc.Container([
     html.H1("Base", className="text-center text-primary mb-4"),
     html.P("Clique nos cabeçalhos abaixo para filtrar os dados da tabela."),
     html.Hr(),
-    # ADICIONE O BOTÃO AQUI
     dbc.Button(
         "Limpar Todos os Filtros",
         id="btn-limpar-filtros-geral",
@@ -313,17 +445,16 @@ layout_visao_geral = dbc.Container([
         className="mb-3"
     ),
     html.Div([
-        # Adicionamos o dcc.Loading envolvendo a tabela
         dcc.Loading(
             id="loading-geral",
-            type="circle", # Você pode escolher outros tipos como "dot", "cube", etc.
+            type="circle",
             children=[
                 html.Table([
                     html.Thead(id='tabela-header-geral'),
                     html.Tbody(id='tabela-body-geral')
                 ], className='custom-table')
             ]
-        )], id='scrollable-container-comp', style={'overflowX': 'auto', 'width': f'{INVERSE_WIDTH:.2f}%'}),
+        )], id='scrollable-container-geral', style={'overflowX': 'auto', 'width': f'{INVERSE_WIDTH:.2f}%'}),
     dbc.Row([
         dbc.Col(dbc.Button("<< Primeira", id="btn-primeira-geral", color="secondary"), width="auto"),
         dbc.Col(dbc.Button("< Anterior", id="btn-anterior-geral", color="primary"), width="auto"),
@@ -340,7 +471,6 @@ layout_comparativo = dbc.Container([
     html.H1("Comparativo de Planos", className="text-center text-primary mb-4"),
     html.P("Comparação do plano mais recente vs. o plano anterior para cada localidade. Clique nos cabeçalhos para filtrar."),
     html.Hr(),
-    # ADICIONE O BOTÃO AQUI
     dbc.Button(
         "Limpar Todos os Filtros",
         id="btn-limpar-filtros-comp",
@@ -348,10 +478,9 @@ layout_comparativo = dbc.Container([
         className="mb-3"
     ),
     html.Div([
-        # Adicionamos o dcc.Loading envolvendo a tabela
         dcc.Loading(
             id="loading-comp",
-            type="circle", # Você pode escolher outros tipos como "dot", "cube", etc.
+            type="circle",
             children=[
                 html.Table([
                     html.Thead(id='tabela-header-comp'),
@@ -398,7 +527,7 @@ layout_posicionamento = dbc.Container([
     html.Hr(),
     html.Div([
         html.Table([
-            html.Thead(id='tabela-header-pos-loja'), # <-- LINHA MODIFICADA COM ID ÚNICO
+            html.Thead(id='tabela-header-pos-loja'),
         ], className='custom-table', style={'marginBottom': '20px'})
     ]),
     dbc.Row([
@@ -424,7 +553,7 @@ layout_posicionamento_categoria = dbc.Container([
     html.Hr(),
     html.Div([
         html.Table([
-            html.Thead(id='tabela-header-pos-cat'), # <-- LINHA MODIFICADA COM ID ÚNICO
+            html.Thead(id='tabela-header-pos-cat'),
         ], className='custom-table', style={'marginBottom': '20px'})
     ]),
     dbc.Row([
@@ -453,10 +582,10 @@ layout_movimentacao_horario = dbc.Container([
             html.Label("Data da Pesquisa:"),
             dcc.DatePickerSingle(
                 id='filtro-data-horario',
-                min_date_allowed=df['DATA_HORA'].min().date(),
-                max_date_allowed=df['DATA_HORA'].max().date(),
-                initial_visible_month=df['DATA_HORA'].max().date(),
-                date=df['DATA_HORA'].max().date(),
+                min_date_allowed=df['DATA_HORA'].min().date() if not df.empty else None,
+                max_date_allowed=df['DATA_HORA'].max().date() if not df.empty else None,
+                initial_visible_month=df['DATA_HORA'].max().date() if not df.empty else None,
+                date=df['DATA_HORA'].max().date() if not df.empty else None,
                 display_format='DD/MM/YYYY',
                 className="w-100"
             )
@@ -465,9 +594,9 @@ layout_movimentacao_horario = dbc.Container([
             html.Label("Data de Retirada:"),
             dcc.DatePickerSingle(
                 id='filtro-retirada-horario',
-                min_date_allowed=df['RETIRADA'].min().date(),
-                max_date_allowed=df['RETIRADA'].max().date(),
-                initial_visible_month=df['RETIRADA'].max().date(),
+                min_date_allowed=df['RETIRADA'].min().date() if not df.empty else None,
+                max_date_allowed=df['RETIRADA'].max().date() if not df.empty else None,
+                initial_visible_month=df['RETIRADA'].max().date() if not df.empty else None,
                 date=None,
                 display_format='DD/MM/YYYY',
                 placeholder="Selecione a Retirada...",
@@ -498,7 +627,7 @@ layout_movimentacao_horario = dbc.Container([
             html.Label("LOR:"),
             dcc.Dropdown(
                 id='filtro-lor-horario',
-                options=[{'label': i, 'value': i} for i in sorted(df['DURAÇÃO'].dropna().unique())],
+                options=[{'label': i, 'value': i} for i in sorted(df['DURAÇÃO'].dropna().unique())] if 'DURAÇÃO' in df.columns else [],
                 multi=True,
                 placeholder="Todas os LORs"
             )
@@ -520,33 +649,153 @@ layout_movimentacao_horario = dbc.Container([
     html.P("by Tiago Garcéa e Felipe ", style={"color": "gray", "font-size": "9pt", "margin-top": "20px"})
 ], fluid=True)
 
-
+# --- LAYOUT PRINCIPAL DO APP (MODIFICADO) ---
 app.layout = html.Div([
-    dcc.Location(id="url", refresh=False),
-    sidebar,
-    html.Div(id="page-content", style=CONTENT_STYLE)
+    dcc.Store(id='session-store', storage_type='session'),
+    dcc.Location(id='url', refresh=False),
+    html.Div(id='page-container') # Este Div conterá ou a tela de login ou o dashboard
 ])
+
 
 # ==============================================================================
 # 6. CALLBACKS
 # ==============================================================================
-@app.callback(Output('page-content', 'children'), [Input('url', 'pathname')])
-def display_page(pathname):
+
+# --- CALLBACK PRINCIPAL DE ROTEAMENTO E EXIBIÇÃO (NOVO) ---
+@app.callback(
+    Output('page-container', 'children'),
+    Input('url', 'pathname'),
+    State('session-store', 'data')
+)
+def main_router_and_display(pathname, session_data):
+    # Se não estiver logado, redireciona para a tela de login, a menos que já esteja nela ou na de registro
+    if not session_data or 'username' not in session_data:
+        if pathname == '/register':
+            return register_layout
+        return login_layout
+
+    # Se estiver logado, monta o layout do dashboard
+    user_role = session_data.get('role', 'user')
+    CONTENT_STYLE = { "marginLeft": "18rem", "padding": "2rem 1rem", "transform": f"scale({INITIAL_SCALE})", "transformOrigin": "top left" }
+
+    # Determina qual página de conteúdo mostrar
+    page_content = layout_visao_geral
     if pathname == '/comparativo':
-        return layout_comparativo
+        page_content = layout_comparativo
     elif pathname == '/dashboard':
-        return layout_dashboard
+        page_content = layout_dashboard
     elif pathname == '/posicionamento':
-        return layout_posicionamento
+        page_content = layout_posicionamento
     elif pathname == '/posicionamento-categoria':
-        return layout_posicionamento_categoria
+        page_content = layout_posicionamento_categoria
     elif pathname == '/movimentacao-horario':
-        return layout_movimentacao_horario
+        page_content = layout_movimentacao_horario
+    elif pathname == '/admin-logs' and user_role == 'admin':
+        page_content = layout_admin_logs
+
+    return html.Div([
+        create_sidebar(user_role),
+        html.Div(page_content, id="page-content", style=CONTENT_STYLE)
+    ])
+
+
+# --- NOVOS CALLBACKS DE AUTENTICAÇÃO ---
+@app.callback(
+    Output('url', 'pathname', allow_duplicate=True),
+    Output('session-store', 'data'),
+    Output('login-alert', 'children'),
+    Input('login-button', 'n_clicks'),
+    State('login-username', 'value'),
+    State('login-password', 'value'),
+    prevent_initial_call=True
+)
+def handle_login(n_clicks, username, password):
+    if not username or not password:
+        return no_update, no_update, dbc.Alert("Preencha todos os campos.", color="warning")
+
+    user = get_user(username)
+
+    if not user:
+        return no_update, no_update, dbc.Alert("Usuário ou senha inválidos.", color="danger")
+
+    if user['password_hash'] and check_password_hash(user['password_hash'], password):
+        log_access(username)
+        session_data = {'username': user['username'], 'role': user['role']}
+        return '/', session_data, None
+    elif not user['password_hash']:
+         return no_update, no_update, dbc.Alert(html.Div(["Parece ser seu primeiro acesso. ", dcc.Link("Clique aqui para cadastrar sua senha.", href="/register")]), color="info")
     else:
-        return layout_visao_geral
+        return no_update, no_update, dbc.Alert("Usuário ou senha inválidos.", color="danger")
 
 @app.callback(
-    # IDs atualizados conforme sua nova implementação
+    Output('url', 'pathname', allow_duplicate=True),
+    Output('session-store', 'clear_data', allow_duplicate=True),
+    Input('logout-button', 'n_clicks'),
+    prevent_initial_call=True
+)
+def handle_logout(n_clicks):
+    if n_clicks:
+        return '/login', True
+    return no_update, no_update
+
+@app.callback(
+    Output('register-alert', 'children'),
+    Output('url', 'pathname', allow_duplicate=True),
+    Input('register-button', 'n_clicks'),
+    State('register-username', 'value'),
+    State('register-password', 'value'),
+    State('register-confirm-password', 'value'),
+    prevent_initial_call=True
+)
+def handle_register(n_clicks, username, pw1, pw2):
+    if not all([username, pw1, pw2]):
+        return dbc.Alert("Preencha todos os campos.", color="warning"), no_update
+
+    username = username.strip().lower()
+
+    if username not in [u.lower() for u in ALL_PREDEFINED_USERS]:
+        return dbc.Alert(f"O login '{username}' não existe ou não está na lista de usuários predefinidos.", color="danger"), no_update
+
+    user = get_user(username)
+    if not user:
+         return dbc.Alert(f"Erro interno: usuário '{username}' não encontrado no banco de dados, embora esteja predefinido.", color="danger"), no_update
+
+    if user['password_hash']:
+        return dbc.Alert("Este usuário já possui uma senha cadastrada.", color="warning"), no_update
+
+    if len(pw1) < 4:
+        return dbc.Alert("A senha deve ter pelo menos 4 caracteres.", color="warning"), no_update
+
+    if pw1 != pw2:
+        return dbc.Alert("As senhas não coincidem.", color="danger"), no_update
+
+    update_user_password(username, pw1)
+    success_message = html.Div([
+        dbc.Alert("Senha cadastrada! Você será redirecionado para o login...", color="success"),
+        dcc.Location(id='redirect-to-login', pathname='/login', refresh=True)
+    ])
+    return success_message, no_update
+
+@app.callback(
+    Output('log-table-container', 'children'),
+    Input('url', 'pathname'),
+    State('session-store', 'data')
+)
+def load_log_table(pathname, session_data):
+    if pathname == '/admin-logs' and session_data and session_data.get('role') == 'admin':
+        df_logs = get_all_logs()
+        if df_logs.empty:
+            return dbc.Alert("Nenhum registro de acesso encontrado.", color="info")
+
+        df_logs['HORA DO ACESSO'] = pd.to_datetime(df_logs['HORA DO ACESSO']).dt.strftime('%d/%m/%Y %H:%M:%S')
+        return dbc.Table.from_dataframe(df_logs, striped=True, bordered=True, hover=True, dark=True, responsive=True)
+    return no_update
+
+# ==============================================================================
+# SEUS CALLBACKS E FUNÇÕES ORIGINAIS (INTACTOS)
+# ==============================================================================
+
+@app.callback(
     Output('tabela-header-geral', 'children'),
     Output('tabela-body-geral', 'children'),
     Output('store-pagina-atual-geral', 'data'),
@@ -555,15 +804,12 @@ def display_page(pathname):
     Output('btn-anterior-geral', 'disabled'),
     Output('btn-proxima-geral', 'disabled'),
     Output('btn-ultima-geral', 'disabled'),
-
-    # Inputs conforme sua nova implementação
     Input({'type': 'options-list-geral', 'index': ALL}, 'value'),
     Input('btn-primeira-geral', 'n_clicks'),
     Input('btn-anterior-geral', 'n_clicks'),
     Input('btn-proxima-geral', 'n_clicks'),
     Input('btn-ultima-geral', 'n_clicks'),
     Input("btn-limpar-filtros-geral", "n_clicks"),
-
     State('store-pagina-atual-geral', 'data'),
     State({'type': 'options-list-geral', 'index': ALL}, 'id')
 )
@@ -572,45 +818,41 @@ def update_dynamic_table_geral(
     pagina_atual, ids_dos_filtros):
 
     triggered_id = ctx.triggered_id
+    if df_tabela.empty:
+        return html.Tr(html.Th("Nenhum dado carregado")), html.Tr(html.Td("Nenhum dado para exibir.", colSpan=10, style={'textAlign': 'center'})), 1, "Página 1 de 1", True, True, True, True
 
-    # Mapeia colunas para os valores selecionados nos filtros
     filtros_ativos = {id_filtro['index']: valores for id_filtro, valores in zip(ids_dos_filtros, valores_dos_filtros) if valores}
 
-    # LÓGICA DE RESET: Se o botão de limpar foi clicado, esvazie os filtros
     if triggered_id == 'btn-limpar-filtros-geral':
         filtros_ativos = {}
 
-    # --- Aplica os filtros ao DataFrame principal ---
     dff = df_tabela.copy()
     if filtros_ativos:
         for nome_da_coluna, valores_selecionados in filtros_ativos.items():
-            opcoes_todas = df_tabela[nome_da_coluna].dropna().astype(str).unique()
-            if len(valores_selecionados) < len(opcoes_todas):
-                dff = dff[dff[nome_da_coluna].astype(str).isin(valores_selecionados)]
+            if nome_da_coluna in dff.columns:
+                opcoes_todas = df_tabela[nome_da_coluna].dropna().astype(str).unique()
+                if len(valores_selecionados) < len(opcoes_todas):
+                    dff = dff[dff[nome_da_coluna].astype(str).isin(valores_selecionados)]
 
-    # --- ETAPA 1: GERAÇÃO DO CABEÇALHO DINÂMICO ---
     page_prefix = 'geral'
     colunas_para_exibir_header = ['#'] + df_tabela.columns.tolist()
     header_rows = []
 
     for coluna in colunas_para_exibir_header:
         if coluna == '#':
-            header_cell = html.Th("#", style={'width': '50px', 'minWidth': '50px', 'padding': '10px', 'textAlign': 'center'})
-            header_rows.append(header_cell)
+            header_rows.append(html.Th("#", style={'width': '50px', 'minWidth': '50px', 'padding': '10px', 'textAlign': 'center'}))
             continue
 
-        # LÓGICA PRINCIPAL: Filtra o DF por TODAS AS OUTRAS colunas para obter as opções corretas
         df_para_opcoes = df_tabela.copy()
         for outra_coluna, valores in filtros_ativos.items():
-            if outra_coluna != coluna:
+            if outra_coluna != coluna and outra_coluna in df_para_opcoes.columns:
                 df_para_opcoes = df_para_opcoes[df_para_opcoes[outra_coluna].astype(str).isin(valores)]
 
         opcoes_unicas = sorted(df_para_opcoes[coluna].dropna().astype(str).unique())
         valores_selecionados_atuais = filtros_ativos.get(coluna, opcoes_unicas)
 
-        # Lógica para calcular a largura da coluna
         header_len = len(coluna)
-        max_content_len = df_tabela[coluna].astype(str).str.len().max()
+        max_content_len = df_tabela[coluna].astype(str).str.len().max() if not df_tabela.empty and coluna in df_tabela.columns else 0
         if pd.isna(max_content_len): max_content_len = 0
         optimal_len = max(header_len, int(max_content_len))
         width_px = max(120, min(400, optimal_len * 9 + 30))
@@ -619,33 +861,20 @@ def update_dynamic_table_geral(
         header_cell = html.Th([
             dbc.Button(coluna, id={'type': f'filter-btn-{page_prefix}', 'index': coluna}, className="w-100 h-100 text-truncate", style={'borderRadius': 0, 'textAlign': 'left', 'padding': '10px', 'backgroundColor': '#3c3c3c', 'border': 'none', 'fontWeight': 'bold'}),
             dbc.Popover(dbc.PopoverBody([
-                dcc.Checklist(
-                    id={'type': f'select-all-{page_prefix}', 'index': coluna},
-                    options=[{'label': 'Selecionar Tudo', 'value': 'all'}],
-                    value=['all'] if len(valores_selecionados_atuais) == len(opcoes_unicas) else [],
-                    className="mb-2 fw-bold"
-                ),
+                dcc.Checklist(id={'type': f'select-all-{page_prefix}', 'index': coluna}, options=[{'label': 'Selecionar Tudo', 'value': 'all'}], value=['all'] if len(valores_selecionados_atuais) == len(opcoes_unicas) else [], className="mb-2 fw-bold"),
                 html.Hr(className="my-1"),
-                dcc.Checklist(
-                    id={'type': f'options-list-{page_prefix}', 'index': coluna},
-                    options=[{'label': i, 'value': i} for i in opcoes_unicas],
-                    value=valores_selecionados_atuais,
-                    style={'maxHeight': '200px', 'overflowY': 'auto', 'overflowX': 'hidden'},
-                    labelClassName="d-block text-truncate"
-                )
+                dcc.Checklist(id={'type': f'options-list-{page_prefix}', 'index': coluna}, options=[{'label': i, 'value': i} for i in opcoes_unicas], value=valores_selecionados_atuais, style={'maxHeight': '200px', 'overflowY': 'auto', 'overflowX': 'hidden'}, labelClassName="d-block text-truncate")
             ]), target={'type': f'filter-btn-{page_prefix}', 'index': coluna}, trigger="legacy")
         ], style={'width': width_str, 'maxWidth': width_str, 'minWidth': width_str})
         header_rows.append(header_cell)
 
     cabecalho_final = html.Tr(header_rows)
 
-    # --- ETAPA 2: LÓGICA DE PAGINAÇÃO ---
     total_linhas = len(dff)
     total_paginas = math.ceil(total_linhas / PAGE_SIZE) if total_linhas > 0 else 1
 
     nova_pagina = pagina_atual
-    # Reseta a página se um filtro foi alterado ou limpo
-    if isinstance(triggered_id, dict) or triggered_id == 'btn-limpar-filtros-comp':
+    if isinstance(triggered_id, dict) or triggered_id == 'btn-limpar-filtros-geral':
         nova_pagina = 1
     elif isinstance(triggered_id, str):
         if 'btn-primeira' in triggered_id: nova_pagina = 1
@@ -653,9 +882,8 @@ def update_dynamic_table_geral(
         elif 'btn-proxima' in triggered_id: nova_pagina = min(total_paginas, pagina_atual + 1)
         elif 'btn-ultima' in triggered_id: nova_pagina = total_paginas
 
-    nova_pagina = min(nova_pagina, total_paginas)
+    nova_pagina = min(nova_pagina, total_paginas) if total_paginas > 0 else 1
 
-    # --- ETAPA 3: GERAÇÃO DO CORPO DA TABELA ---
     dff = dff.reset_index(drop=True)
     dff.insert(0, '#', dff.index + 1)
 
@@ -667,20 +895,17 @@ def update_dynamic_table_geral(
     table_rows = []
     if not dff_paginado.empty:
         for _, row in dff_paginado.iterrows():
-            table_rows.append(html.Tr([html.Td(row[col]) for col in colunas_para_exibir_body]))
+            table_rows.append(html.Tr([html.Td(row.get(col, '')) for col in colunas_para_exibir_body]))
     else:
         table_rows.append(html.Tr(html.Td("Nenhum dado encontrado.", colSpan=len(colunas_para_exibir_body), style={'textAlign': 'center'})))
 
-    # --- ETAPA 4: ATUALIZAÇÃO DOS ELEMENTOS DE PAGINAÇÃO ---
     texto_paginacao = f"Página {nova_pagina} de {total_paginas}"
     disable_first = disable_prev = nova_pagina == 1
     disable_last = disable_next = nova_pagina == total_paginas
 
-    # --- ETAPA 5: RETORNO DE TODOS OS OUTPUTS NA ORDEM CORRETA ---
     return cabecalho_final, table_rows, nova_pagina, texto_paginacao, disable_first, disable_prev, disable_next, disable_last
 
 
-# --- Callback Tabela COMPARATIVO ---
 @app.callback(
     Output('tabela-header-comp', 'children'),
     Output('tabela-body-comp', 'children'),
@@ -690,14 +915,12 @@ def update_dynamic_table_geral(
     Output('btn-anterior-comp', 'disabled'),
     Output('btn-proxima-comp', 'disabled'),
     Output('btn-ultima-comp', 'disabled'),
-
     Input({'type': 'options-list-comp', 'index': ALL}, 'value'),
     Input('btn-primeira-comp', 'n_clicks'),
     Input('btn-anterior-comp', 'n_clicks'),
     Input('btn-proxima-comp', 'n_clicks'),
     Input('btn-ultima-comp', 'n_clicks'),
     Input("btn-limpar-filtros-comp", "n_clicks"),
-
     State('store-pagina-atual-comp', 'data'),
     State({'type': 'options-list-comp', 'index': ALL}, 'id')
 )
@@ -706,45 +929,41 @@ def update_dynamic_table_comparativo(
     pagina_atual, ids_dos_filtros):
 
     triggered_id = ctx.triggered_id
+    if df_comparativo.empty:
+        return html.Tr(html.Th("Nenhum dado para comparar")), html.Tr(html.Td("Nenhum dado para exibir.", colSpan=10, style={'textAlign': 'center'})), 1, "Página 1 de 1", True, True, True, True
 
-    # Mapeia colunas para os valores selecionados nos filtros
     filtros_ativos = {id_filtro['index']: valores for id_filtro, valores in zip(ids_dos_filtros, valores_dos_filtros) if valores}
 
-    # LÓGICA DE RESET: Se o botão de limpar foi clicado, esvazie os filtros
     if triggered_id == 'btn-limpar-filtros-comp':
         filtros_ativos = {}
 
-    # --- Aplica os filtros ao DataFrame principal ---
     dff = df_comparativo.copy()
     if filtros_ativos:
         for nome_da_coluna, valores_selecionados in filtros_ativos.items():
-            opcoes_todas = df_comparativo[nome_da_coluna].dropna().astype(str).unique()
-            if len(valores_selecionados) < len(opcoes_todas):
-                dff = dff[dff[nome_da_coluna].astype(str).isin(valores_selecionados)]
+            if nome_da_coluna in dff.columns:
+                opcoes_todas = df_comparativo[nome_da_coluna].dropna().astype(str).unique()
+                if len(valores_selecionados) < len(opcoes_todas):
+                    dff = dff[dff[nome_da_coluna].astype(str).isin(valores_selecionados)]
 
-    # --- ETAPA 1: GERAÇÃO DO CABEÇALHO DINÂMICO ---
     page_prefix = 'comp'
     colunas_para_exibir_header = ['#'] + df_comparativo.columns.tolist()
     header_rows = []
 
     for coluna in colunas_para_exibir_header:
         if coluna == '#':
-            header_cell = html.Th("#", style={'width': '50px', 'minWidth': '50px', 'padding': '10px', 'textAlign': 'center'})
-            header_rows.append(header_cell)
+            header_rows.append(html.Th("#", style={'width': '50px', 'minWidth': '50px', 'padding': '10px', 'textAlign': 'center'}))
             continue
 
-        # LÓGICA PRINCIPAL: Filtra o DF por TODAS AS OUTRAS colunas para obter as opções corretas
         df_para_opcoes = df_comparativo.copy()
         for outra_coluna, valores in filtros_ativos.items():
-            if outra_coluna != coluna:
+            if outra_coluna != coluna and outra_coluna in df_para_opcoes.columns:
                 df_para_opcoes = df_para_opcoes[df_para_opcoes[outra_coluna].astype(str).isin(valores)]
 
         opcoes_unicas = sorted(df_para_opcoes[coluna].dropna().astype(str).unique())
         valores_selecionados_atuais = filtros_ativos.get(coluna, opcoes_unicas)
 
-        # Lógica para calcular a largura da coluna
         header_len = len(coluna)
-        max_content_len = df_comparativo[coluna].astype(str).str.len().max()
+        max_content_len = df_comparativo[coluna].astype(str).str.len().max() if not df_comparativo.empty and coluna in df_comparativo.columns else 0
         if pd.isna(max_content_len): max_content_len = 0
         optimal_len = max(header_len, int(max_content_len))
         width_px = max(120, min(400, optimal_len * 9 + 30))
@@ -753,32 +972,19 @@ def update_dynamic_table_comparativo(
         header_cell = html.Th([
             dbc.Button(coluna, id={'type': f'filter-btn-{page_prefix}', 'index': coluna}, className="w-100 h-100 text-truncate", style={'borderRadius': 0, 'textAlign': 'left', 'padding': '10px', 'backgroundColor': '#3c3c3c', 'border': 'none', 'fontWeight': 'bold'}),
             dbc.Popover(dbc.PopoverBody([
-                dcc.Checklist(
-                    id={'type': f'select-all-{page_prefix}', 'index': coluna},
-                    options=[{'label': 'Selecionar Tudo', 'value': 'all'}],
-                    value=['all'] if len(valores_selecionados_atuais) == len(opcoes_unicas) else [],
-                    className="mb-2 fw-bold"
-                ),
+                dcc.Checklist(id={'type': f'select-all-{page_prefix}', 'index': coluna}, options=[{'label': 'Selecionar Tudo', 'value': 'all'}], value=['all'] if len(valores_selecionados_atuais) == len(opcoes_unicas) else [], className="mb-2 fw-bold"),
                 html.Hr(className="my-1"),
-                dcc.Checklist(
-                    id={'type': f'options-list-{page_prefix}', 'index': coluna},
-                    options=[{'label': i, 'value': i} for i in opcoes_unicas],
-                    value=valores_selecionados_atuais,
-                    style={'maxHeight': '200px', 'overflowY': 'auto', 'overflowX': 'hidden'},
-                    labelClassName="d-block text-truncate"
-                )
+                dcc.Checklist(id={'type': f'options-list-{page_prefix}', 'index': coluna}, options=[{'label': i, 'value': i} for i in opcoes_unicas], value=valores_selecionados_atuais, style={'maxHeight': '200px', 'overflowY': 'auto', 'overflowX': 'hidden'}, labelClassName="d-block text-truncate")
             ]), target={'type': f'filter-btn-{page_prefix}', 'index': coluna}, trigger="legacy")
         ], style={'width': width_str, 'maxWidth': width_str, 'minWidth': width_str})
         header_rows.append(header_cell)
 
     cabecalho_final = html.Tr(header_rows)
 
-    # --- ETAPA 2: LÓGICA DE PAGINAÇÃO ---
     total_linhas = len(dff)
     total_paginas = math.ceil(total_linhas / PAGE_SIZE) if total_linhas > 0 else 1
 
     nova_pagina = pagina_atual
-    # Reseta a página se um filtro foi alterado ou limpo
     if isinstance(triggered_id, dict) or triggered_id == 'btn-limpar-filtros-comp':
         nova_pagina = 1
     elif isinstance(triggered_id, str):
@@ -787,9 +993,8 @@ def update_dynamic_table_comparativo(
         elif 'btn-proxima' in triggered_id: nova_pagina = min(total_paginas, pagina_atual + 1)
         elif 'btn-ultima' in triggered_id: nova_pagina = total_paginas
 
-    nova_pagina = min(nova_pagina, total_paginas)
+    nova_pagina = min(nova_pagina, total_paginas) if total_paginas > 0 else 1
 
-    # --- ETAPA 3: GERAÇÃO DO CORPO DA TABELA ---
     dff = dff.reset_index(drop=True)
     dff.insert(0, '#', dff.index + 1)
 
@@ -801,20 +1006,18 @@ def update_dynamic_table_comparativo(
     table_rows = []
     if not dff_paginado.empty:
         for _, row in dff_paginado.iterrows():
-            table_rows.append(html.Tr([html.Td(row[col]) for col in colunas_para_exibir_body]))
+            table_rows.append(html.Tr([html.Td(row.get(col, '')) for col in colunas_para_exibir_body]))
     else:
         table_rows.append(html.Tr(html.Td("Nenhum dado encontrado.", colSpan=len(colunas_para_exibir_body), style={'textAlign': 'center'})))
 
-    # --- ETAPA 4: ATUALIZAÇÃO DOS ELEMENTOS DE PAGINAÇÃO ---
     texto_paginacao = f"Página {nova_pagina} de {total_paginas}"
     disable_first = disable_prev = nova_pagina == 1
     disable_last = disable_next = nova_pagina == total_paginas
 
-    # --- ETAPA 5: RETORNO DE TODOS OS OUTPUTS NA ORDEM CORRETA ---
     return cabecalho_final, table_rows, nova_pagina, texto_paginacao, disable_first, disable_prev, disable_next, disable_last
 
 # ==============================================================================
-# SEÇÃO DE FUNÇÕES E CALLBACKS DE POSICIONAMENTO
+# SEÇÃO DE FUNÇÕES E CALLBACKS DE POSICIONAMENTO (ORIGINAL E CORRIGIDO)
 # ==============================================================================
 def dataframe_to_html_table(df, is_percent=False):
     table_header = [html.Th("RETIRADA")] + [html.Th(col) for col in df.columns]
@@ -929,37 +1132,28 @@ def calculate_foco_diff(group):
         return (preco_menor_geral / preco_menor_foco) - 1
 
 
-###################################################### POSICIONAMENTO POR LOJA #################################################
-
 @app.callback(
-    # Outputs: Adicionamos o cabeçalho como o primeiro Output
     Output('tabela-header-pos-loja', 'children'),
     Output('matriz-menor-preco-container', 'children'),
     Output('matriz-diferenca-foco-container', 'children'),
-
-    # Inputs e States
     Input({'type': 'options-list-pos-loja', 'index': ALL}, 'value'),
     State({'type': 'options-list-pos-loja', 'index': ALL}, 'id')
 )
 def update_dynamic_posicionamento_loja(valores_dos_filtros, ids_dos_filtros):
+    if df_tabela.empty:
+        return html.Tr(html.Th("Nenhum dado carregado")), "", ""
 
-    # Mapeia colunas para os valores selecionados nos filtros
     filtros_ativos = {id_filtro['index']: valores for id_filtro, valores in zip(ids_dos_filtros, valores_dos_filtros) if valores}
 
     is_initial_load = not ctx.triggered_id and not filtros_ativos
-    if is_initial_load:
-        # Defina seu filtro padrão aqui.
-        # Formato: {'Nome_da_Coluna': ['Valor_a_Filtrar']}
+    if is_initial_load and plano_recente != "N/A":
         filtros_ativos = {'PLANO': [plano_recente]}
-    # --- FIM DA LÓGICA DO FILTRO PADRÃO ---
-    # --- ETAPA 1: GERAÇÃO DO CABEÇALHO DINÂMICO ---
+
     page_prefix = 'pos-loja'
     header_rows = []
-    # Usamos df_tabela.columns para definir QUAIS filtros existem.
     colunas_de_filtro = df_tabela.columns.tolist()
 
     for coluna in colunas_de_filtro:
-        # LÓGICA PRINCIPAL: Filtra o df_tabela por TODAS AS OUTRAS colunas para obter as opções corretas
         df_para_opcoes = df_tabela.copy()
         for outra_coluna, valores in filtros_ativos.items():
             if outra_coluna != coluna and outra_coluna in df_para_opcoes.columns:
@@ -968,36 +1162,19 @@ def update_dynamic_posicionamento_loja(valores_dos_filtros, ids_dos_filtros):
         opcoes_unicas = sorted(df_para_opcoes[coluna].dropna().astype(str).unique())
         valores_selecionados_atuais = filtros_ativos.get(coluna, opcoes_unicas)
 
-        # Lógica de estilo e criação do componente Popover/Checklist
         width_px = max(120, min(400, len(coluna) * 9 + 60))
         width_str = f'{width_px}px'
-
         header_cell = html.Th([
             dbc.Button(coluna, id={'type': f'filter-btn-{page_prefix}', 'index': coluna}, className="w-100 h-100 text-truncate", style={'borderRadius': 0, 'textAlign': 'left', 'padding': '10px', 'backgroundColor': '#3c3c3c', 'border': 'none', 'fontWeight': 'bold'}),
             dbc.Popover(dbc.PopoverBody([
-                dcc.Checklist(
-                    id={'type': f'select-all-{page_prefix}', 'index': coluna},
-                    options=[{'label': 'Selecionar Tudo', 'value': 'all'}],
-                    value=['all'] if len(valores_selecionados_atuais) == len(opcoes_unicas) else [],
-                    className="mb-2 fw-bold"
-                ),
+                dcc.Checklist(id={'type': f'select-all-{page_prefix}', 'index': coluna}, options=[{'label': 'Selecionar Tudo', 'value': 'all'}], value=['all'] if len(valores_selecionados_atuais) == len(opcoes_unicas) else [], className="mb-2 fw-bold"),
                 html.Hr(className="my-1"),
-                dcc.Checklist(
-                    id={'type': f'options-list-{page_prefix}', 'index': coluna},
-                    options=[{'label': i, 'value': i} for i in opcoes_unicas],
-                    value=valores_selecionados_atuais,
-                    style={'maxHeight': '200px', 'overflowY': 'auto', 'overflowX': 'hidden'},
-                    labelClassName="d-block text-truncate"
-                )
+                dcc.Checklist(id={'type': f'options-list-{page_prefix}', 'index': coluna}, options=[{'label': i, 'value': i} for i in opcoes_unicas], value=valores_selecionados_atuais, style={'maxHeight': '200px', 'overflowY': 'auto', 'overflowX': 'hidden'}, labelClassName="d-block text-truncate")
             ]), target={'type': f'filter-btn-{page_prefix}', 'index': coluna}, trigger="legacy")
         ], style={'width': width_str, 'maxWidth': width_str, 'minWidth': width_str})
         header_rows.append(header_cell)
-
     cabecalho_final = html.Tr(header_rows)
 
-
-    # --- ETAPA 2: FILTRAGEM E GERAÇÃO DAS MATRIZES ---
-    # Esta parte é a lógica do seu callback original.
     dff = df_calculos.copy()
     if filtros_ativos:
         for nome_da_coluna, valores in filtros_ativos.items():
@@ -1011,62 +1188,44 @@ def update_dynamic_posicionamento_loja(valores_dos_filtros, ids_dos_filtros):
         msg_vazia = html.P("Nenhum dado encontrado para os filtros aplicados.")
         return cabecalho_final, msg_vazia, msg_vazia
 
-    # Gera a Matriz 1 (Menor Preço)
     try:
         idx_min_preco = dff.loc[dff.groupby(['RETIRADA', 'LOCALIDADE'])['PREÇO'].idxmin()]
-        matriz1_df = idx_min_preco.pivot_table(
-            index='RETIRADA', columns='LOCALIDADE', values='LOCADORA', aggfunc='first'
-        ).fillna("-")
+        matriz1_df = idx_min_preco.pivot_table(index='RETIRADA', columns='LOCALIDADE', values='LOCADORA', aggfunc='first').fillna("-")
         tabela1_html = dataframe_to_html_table(matriz1_df)
     except Exception as e:
         tabela1_html = dbc.Alert(f"Erro ao gerar Matriz 1: {e}", color="danger")
 
-    # Gera a Matriz 2 (Diferença para o Foco)
     try:
-        # Adicionado include_groups=False para evitar DeprecationWarning e garantir compatibilidade
         matriz2_series = dff.groupby(['RETIRADA', 'LOCALIDADE']).apply(calculate_foco_diff, include_groups=False)
         matriz2_df = matriz2_series.unstack(level='LOCALIDADE')
         tabela2_html = dataframe_to_html_table(matriz2_df, is_percent=True)
     except Exception as e:
         tabela2_html = dbc.Alert(f"Erro ao gerar Matriz 2: {e}", color="danger")
 
-    # --- ETAPA 3: RETORNO DE TODOS OS OUTPUTS ---
     return cabecalho_final, tabela1_html, tabela2_html
 
-############################################## POSICIONAMENTO CAT ##################################################
-
-
-
-
 @app.callback(
-    # Outputs: O novo cabeçalho e as duas matrizes existentes
     Output('tabela-header-pos-cat', 'children'),
     Output('matriz-menor-preco-categoria-container', 'children'),
     Output('matriz-diferenca-foco-categoria-container', 'children'),
-
-    # Inputs e States
     Input({'type': 'options-list-pos-cat', 'index': ALL}, 'value'),
     State({'type': 'options-list-pos-cat', 'index': ALL}, 'id')
 )
 def update_dynamic_posicionamento_categoria(valores_dos_filtros, ids_dos_filtros):
+    if df_tabela.empty:
+        return html.Tr(html.Th("Nenhum dado carregado")), "", ""
 
-    # Mapeia colunas para os valores selecionados nos filtros
     filtros_ativos = {id_filtro['index']: valores for id_filtro, valores in zip(ids_dos_filtros, valores_dos_filtros) if valores}
 
     is_initial_load = not ctx.triggered_id and not filtros_ativos
-    if is_initial_load:
-        # Defina seu filtro padrão aqui.
-        # Formato: {'Nome_da_Coluna': ['Valor_a_Filtrar']}
+    if is_initial_load and plano_recente != "N/A":
         filtros_ativos = {'PLANO': [plano_recente]}
-    # --- ETAPA 1: GERAÇÃO DO CABEÇALHO DINÂMICO ---
-    # Nota: O cabeçalho é gerado a partir do df_tabela original para obter todas as colunas de filtro.
+
     page_prefix = 'pos-cat'
     header_rows = []
-    # Usamos df_tabela.columns para definir QUAIS filtros existem.
     colunas_de_filtro = df_tabela.columns.tolist()
 
     for coluna in colunas_de_filtro:
-        # LÓGICA PRINCIPAL: Filtra o df_tabela por TODAS AS OUTRAS colunas para obter as opções corretas
         df_para_opcoes = df_tabela.copy()
         for outra_coluna, valores in filtros_ativos.items():
             if outra_coluna != coluna and outra_coluna in df_para_opcoes.columns:
@@ -1075,35 +1234,19 @@ def update_dynamic_posicionamento_categoria(valores_dos_filtros, ids_dos_filtros
         opcoes_unicas = sorted(df_para_opcoes[coluna].dropna().astype(str).unique())
         valores_selecionados_atuais = filtros_ativos.get(coluna, opcoes_unicas)
 
-        # Lógica de estilo e criação do componente Popover/Checklist
         width_px = max(120, min(400, len(coluna) * 9 + 60))
         width_str = f'{width_px}px'
-
         header_cell = html.Th([
             dbc.Button(coluna, id={'type': f'filter-btn-{page_prefix}', 'index': coluna}, className="w-100 h-100 text-truncate", style={'borderRadius': 0, 'textAlign': 'left', 'padding': '10px', 'backgroundColor': '#3c3c3c', 'border': 'none', 'fontWeight': 'bold'}),
             dbc.Popover(dbc.PopoverBody([
-                dcc.Checklist(
-                    id={'type': f'select-all-{page_prefix}', 'index': coluna},
-                    options=[{'label': 'Selecionar Tudo', 'value': 'all'}],
-                    value=['all'] if len(valores_selecionados_atuais) == len(opcoes_unicas) else [],
-                    className="mb-2 fw-bold"
-                ),
+                dcc.Checklist(id={'type': f'select-all-{page_prefix}', 'index': coluna}, options=[{'label': 'Selecionar Tudo', 'value': 'all'}], value=['all'] if len(valores_selecionados_atuais) == len(opcoes_unicas) else [], className="mb-2 fw-bold"),
                 html.Hr(className="my-1"),
-                dcc.Checklist(
-                    id={'type': f'options-list-{page_prefix}', 'index': coluna},
-                    options=[{'label': i, 'value': i} for i in opcoes_unicas],
-                    value=valores_selecionados_atuais,
-                    style={'maxHeight': '200px', 'overflowY': 'auto', 'overflowX': 'hidden'},
-                    labelClassName="d-block text-truncate"
-                )
+                dcc.Checklist(id={'type': f'options-list-{page_prefix}', 'index': coluna}, options=[{'label': i, 'value': i} for i in opcoes_unicas], value=valores_selecionados_atuais, style={'maxHeight': '200px', 'overflowY': 'auto', 'overflowX': 'hidden'}, labelClassName="d-block text-truncate")
             ]), target={'type': f'filter-btn-{page_prefix}', 'index': coluna}, trigger="legacy")
         ], style={'width': width_str, 'maxWidth': width_str, 'minWidth': width_str})
         header_rows.append(header_cell)
-
     cabecalho_final = html.Tr(header_rows)
 
-    # --- ETAPA 2: FILTRAGEM E GERAÇÃO DAS MATRIZES ---
-    # Esta parte é a lógica do seu callback original, agora usando o 'filtros_ativos' que já definimos.
     dff = df_calculos.copy()
     if filtros_ativos:
         for nome_da_coluna, valores in filtros_ativos.items():
@@ -1117,7 +1260,6 @@ def update_dynamic_posicionamento_categoria(valores_dos_filtros, ids_dos_filtros
         msg_vazia = html.P("Nenhum dado encontrado para os filtros aplicados.")
         return cabecalho_final, msg_vazia, msg_vazia
 
-    # Gera a Matriz 1 (Menor Preço)
     try:
         idx_min_preco = dff.loc[dff.groupby(['CATEGORIA', 'RETIRADA'])['PREÇO'].idxmin()]
         matriz1_df = idx_min_preco.pivot_table(
@@ -1129,7 +1271,6 @@ def update_dynamic_posicionamento_categoria(valores_dos_filtros, ids_dos_filtros
     except Exception as e:
         tabela1_html = dbc.Alert(f"Erro ao gerar Matriz 1: {e}", color="danger")
 
-    # Gera a Matriz 2 (Diferença para o Foco)
     try:
         matriz2_series = dff.groupby(['CATEGORIA', 'RETIRADA']).apply(calculate_foco_diff, include_groups=False)
         matriz2_df = matriz2_series.unstack(level='RETIRADA')
@@ -1138,14 +1279,11 @@ def update_dynamic_posicionamento_categoria(valores_dos_filtros, ids_dos_filtros
     except Exception as e:
         tabela2_html = dbc.Alert(f"Erro ao gerar Matriz 2: {e}", color="danger")
 
-    # --- ETAPA 3: RETORNO DE TODOS OS OUTPUTS ---
     return cabecalho_final, tabela1_html, tabela2_html
 
-############################################# MOVIMENTAÇÃO POR HÓRARIO --- AJUSTADO #####################################################################
+
 @app.callback(
     Output('grafico-movimentacao-horario', 'figure'),
-    Output('filtro-data-horario', 'options'),
-    Output('filtro-retirada-horario', 'options'),
     Output('filtro-localidade-horario', 'options'),
     Output('filtro-locadora-horario', 'options'),
     Output('filtro-categoria-horario', 'options'),
@@ -1158,108 +1296,44 @@ def update_dynamic_posicionamento_categoria(valores_dos_filtros, ids_dos_filtros
     Input('filtro-lor-horario', 'value'),
 )
 def update_movimentacao_horario(selected_date, selected_retirada_date, localidades, locadoras, categorias, lor):
-    # Cria uma figura vazia padrão para casos sem dados
-    fig_vazia = go.Figure()
-    fig_vazia.update_layout(
-        paper_bgcolor="#3c3c3c", plot_bgcolor="#2b2b2b",
-        font_color="#f0f0f0",
-        xaxis={"visible": False}, yaxis={"visible": False}
-    )
+    fig_vazia = go.Figure().update_layout(paper_bgcolor="#3c3c3c", plot_bgcolor="#2b2b2b", font_color="#f0f0f0", xaxis={"visible": False}, yaxis={"visible": False})
 
-    # CORREÇÃO 1: Se a data não for selecionada, retorna um valor para cada um dos 6 outputs.
-    if not selected_date:
+    if not selected_date or df.empty:
         fig_vazia.update_layout(title_text='Por favor, selecione uma data de pesquisa para começar')
-        # dash.no_update evita re-renderizar componentes desnecessariamente.
-        return fig_vazia, no_update, no_update, no_update, no_update, no_update, no_update
+        return fig_vazia, [], [], [], []
 
     dff = df.copy()
-
-    # AJUSTE DE PERFORMANCE: Filtrar por range é muito mais rápido que usar .dt.date
     start_date = pd.to_datetime(selected_date).normalize()
     end_date = start_date + pd.Timedelta(days=1)
     dff = dff[(dff['DATA_HORA'] >= start_date) & (dff['DATA_HORA'] < end_date)]
 
-    # Aplica os outros filtros
     if selected_retirada_date:
         start_retirada = pd.to_datetime(selected_retirada_date).normalize()
         end_retirada = start_retirada + pd.Timedelta(days=1)
         dff = dff[(dff['RETIRADA'] >= start_retirada) & (dff['RETIRADA'] < end_retirada)]
 
-    # --- Lógica para Filtros Dinâmicos ---
-    # Para cada filtro, calculamos as opções válidas com base nos outros filtros já aplicados.
+    opcoes_localidade_dinamicas = [{'label': i, 'value': i} for i in sorted(dff['LOCALIDADE'].dropna().unique())]
+    opcoes_locadora_dinamicas = [{'label': i, 'value': i} for i in sorted(dff['LOCADORA'].dropna().unique())]
+    opcoes_categoria_dinamicas = [{'label': i, 'value': i} for i in sorted(dff['CATEGORIA'].dropna().unique())]
+    opcoes_lor_dinamicas = [{'label': i, 'value': i} for i in sorted(dff['DURAÇÃO'].dropna().unique())] if 'DURAÇÃO' in dff.columns else []
 
-    # Opções para Lor
-    df_lor = dff.copy()
-    if localidades: df_lor = df_lor[df_lor['LOCALIDADE'].isin(localidades)]
-    if locadoras: df_lor = df_lor[df_lor['LOCADORA'].isin(locadoras)]
-    if categorias: df_lor = df_lor[df_lor['CATEGORIA'].isin(categorias)]
-    opcoes_lor = [{'label': i, 'value': i} for i in sorted(df_lor['DURAÇÃO'].dropna().unique())]
+    if localidades: dff = dff[dff['LOCALIDADE'].isin(localidades)]
+    if locadoras: dff = dff[dff['LOCADORA'].isin(locadoras)]
+    if categorias: dff = dff[dff['CATEGORIA'].isin(categorias)]
+    if lor and 'DURAÇÃO' in dff.columns: dff = dff[dff['DURAÇÃO'].isin(lor)]
 
-
-    # Opções para Localidade
-    df_op_loc = dff.copy()
-    if lor: df_op_loc = df_op_loc[df_op_loc['DURAÇÃO'].isin(lor)]
-    if locadoras: df_op_loc = df_op_loc[df_op_loc['LOCADORA'].isin(locadoras)]
-    if categorias: df_op_loc = df_op_loc[df_op_loc['CATEGORIA'].isin(categorias)]
-    opcoes_localidade = [{'label': i, 'value': i} for i in sorted(df_op_loc['LOCALIDADE'].dropna().unique())]
-
-    # Opções para Locadora
-    df_op_locadora = dff.copy()
-    if lor: df_op_locadora = df_op_locadora[df_op_locadora['DURAÇÃO'].isin(lor)]
-    if localidades: df_op_locadora = df_op_locadora[df_op_locadora['LOCALIDADE'].isin(localidades)]
-    if categorias: df_op_locadora = df_op_locadora[df_op_locadora['CATEGORIA'].isin(categorias)]
-    opcoes_locadora = [{'label': i, 'value': i} for i in sorted(df_op_locadora['LOCADORA'].dropna().unique())]
-
-    # Opções para Categoria
-    df_op_cat = dff.copy()
-    if lor: df_op_cat = df_op_cat[df_op_cat['DURAÇÃO'].isin(lor)]
-    if localidades: df_op_cat = df_op_cat[df_op_cat['LOCALIDADE'].isin(localidades)]
-    if locadoras: df_op_cat = df_op_cat[df_op_cat['LOCADORA'].isin(locadoras)]
-    opcoes_categoria = [{'label': i, 'value': i} for i in sorted(df_op_cat['CATEGORIA'].dropna().unique())]
-
-    # Aplica os filtros dos dropdowns para o gráfico final
-    if localidades:
-        dff = dff[dff['LOCALIDADE'].isin(localidades)]
-    if locadoras:
-        dff = dff[dff['LOCADORA'].isin(locadoras)]
-    if categorias:
-        dff = dff[dff['CATEGORIA'].isin(categorias)]
-    if lor:
-        dff = dff[dff['DURAÇÃO'].isin(lor)]
-
-    # CORREÇÃO 2: Se o DataFrame ficar vazio, retorna um gráfico de aviso e as opções calculadas.
     if dff.empty:
         fig_vazia.update_layout(title_text='Nenhum dado encontrado para os filtros selecionados')
-        return fig_vazia, no_update, no_update, opcoes_localidade, opcoes_locadora, opcoes_categoria, opcoes_lor
+        return fig_vazia, opcoes_localidade_dinamicas, opcoes_locadora_dinamicas, opcoes_categoria_dinamicas, opcoes_lor_dinamicas
 
     dff = dff.sort_values('DATA_HORA')
     title_date = pd.to_datetime(selected_date).strftime('%d/%m/%Y')
 
-    fig = px.line(
-        dff,
-        x='DATA_HORA',
-        y='PREÇO',
-        color='LOCADORA',
-        title=f'Variação de Preço ao Longo do Dia - {title_date}',
-        markers=True,
-        labels={'DATA_HORA': 'Horário da Pesquisa', 'PREÇO': 'Preço (R$)', 'LOCADORA': 'Locadora'}
-    )
-
+    fig = px.line(dff, x='DATA_HORA', y='PREÇO', color='LOCADORA', title=f'Variação de Preço ao Longo do Dia - {title_date}', markers=True, labels={'DATA_HORA': 'Horário da Pesquisa', 'PREÇO': 'Preço (R$)', 'LOCADORA': 'Locadora'})
     fig.update_xaxes(tickformat='%H:%M')
-    fig.update_layout(
-        paper_bgcolor="#3c3c3c", plot_bgcolor="#2b2b2b",
-        font_color="#f0f0f0",
-        xaxis_gridcolor="#444", yaxis_gridcolor="#444",
-        legend_title_text='Locadora',
-        xaxis_title="Horário da Pesquisa",
-        yaxis_title="Preço (R$)"
-    )
+    fig.update_layout(paper_bgcolor="#3c3c3c", plot_bgcolor="#2b2b2b", font_color="#f0f0f0", xaxis_gridcolor="#444", yaxis_gridcolor="#444", legend_title_text='Locadora', xaxis_title="Horário da Pesquisa", yaxis_title="Preço (R$)")
 
-    # CORREÇÃO 3: Retorna a figura e as opções para todos os filtros, na ordem correta.
-    return fig, no_update, no_update, opcoes_localidade, opcoes_locadora, opcoes_categoria, opcoes_lor
-
-
-##################################################### BIG PICTURE -----  ###################################################################################
+    return fig, opcoes_localidade_dinamicas, opcoes_locadora_dinamicas, opcoes_categoria_dinamicas, opcoes_lor_dinamicas
 
 
 @app.callback(
@@ -1275,52 +1349,35 @@ def update_movimentacao_horario(selected_date, selected_retirada_date, localidad
     Input('filtro-locadora', 'value')
 )
 def update_dashboard(localidades, locadoras):
-    # --- LÓGICA PARA FILTROS DINÂMICOS ---
-    # Primeiro, calculamos as opções válidas para cada filtro com base na seleção do outro.
+    fig_vazia = go.Figure().update_layout(title_text='Nenhum dado para os filtros', paper_bgcolor="#3c3c3c", plot_bgcolor="#2b2b2b", font_color="#f0f0f0", xaxis={"visible": False}, yaxis={"visible": False})
 
-    # Opções para Localidade (baseado na seleção de Locadora)
+    if df.empty:
+         return "R$ 0,00", "0", "0", fig_vazia, fig_vazia, fig_vazia, [], []
+
     df_op_loc = df.copy()
     if locadoras:
         df_op_loc = df_op_loc[df_op_loc['LOCADORA'].isin(locadoras)]
     opcoes_localidade = [{'label': i, 'value': i} for i in sorted(df_op_loc['LOCALIDADE'].dropna().unique())]
 
-    # Opções para Locadora (baseado na seleção de Localidade)
     df_op_locadora = df.copy()
     if localidades:
         df_op_locadora = df_op_locadora[df_op_locadora['LOCALIDADE'].isin(localidades)]
     opcoes_locadora = [{'label': i, 'value': i} for i in sorted(df_op_locadora['LOCADORA'].dropna().unique())]
 
-    # Agora, aplicamos os filtros para os KPIs e gráficos
     dff = df.copy()
     if localidades: dff = dff[dff['LOCALIDADE'].isin(localidades)]
     if locadoras: dff = dff[dff['LOCADORA'].isin(locadoras)]
 
-    # CORREÇÃO 1: Trata o caso de DataFrame vazio retornando um valor para CADA um dos 8 Outputs.
     if dff.empty:
-        fig_vazia = go.Figure()
-        fig_vazia.update_layout(
-            title_text='Nenhum dado encontrado para os filtros selecionados',
-            paper_bgcolor="#3c3c3c", plot_bgcolor="#2b2b2b", font_color="#f0f0f0",
-            xaxis={"visible": False}, yaxis={"visible": False}
-        )
-        # Retorna 8 valores: 3 KPIs, 3 gráficos vazios e as 2 listas de opções calculadas.
         return "R$ 0,00", "0", "0", fig_vazia, fig_vazia, fig_vazia, opcoes_localidade, opcoes_locadora
 
-    # Lógica para criar KPIs e gráficos (seu código original)
     custom_template = { "layout": { "paper_bgcolor": "#3c3c3c", "plot_bgcolor": "#2b2b2b", "font": {"color": "#f0f0f0"}, "xaxis": {"gridcolor": "#444"}, "yaxis": {"gridcolor": "#444"}, "colorway": px.colors.sequential.Plotly3 } }
-
     preco_medio = dff['PREÇO'].mean()
-    fig_preco_loc = px.bar(dff.groupby('LOCADORA')['PREÇO'].mean().sort_values(ascending=False).reset_index(),
-                           x='LOCADORA', y='PREÇO', title='Preço Médio por Locadora', text_auto='.2f', template=custom_template)
-    fig_preco_loc.update_traces(marker_color='#42a5f5', textposition='outside')
-
-    fig_dist_cat = px.pie(dff, names='CATEGORIA', title='Distribuição por Categoria', hole=0.4, template=custom_template)
-    fig_dist_cat.update_traces(textposition='inside', textinfo='percent+label')
-
+    fig_preco_loc = px.bar(dff.groupby('LOCADORA')['PREÇO'].mean().sort_values(ascending=False).reset_index(), x='LOCADORA', y='PREÇO', title='Preço Médio por Locadora', text_auto='.2f', template=custom_template).update_traces(marker_color='#42a5f5', textposition='outside')
+    fig_dist_cat = px.pie(dff, names='CATEGORIA', title='Distribuição por Categoria', hole=0.4, template=custom_template).update_traces(textposition='inside', textinfo='percent+label')
     df_preco_tempo = dff.groupby(dff['DATA_HORA'].dt.date)['PREÇO'].mean().reset_index()
     fig_preco_tmp = px.line(df_preco_tempo, x='DATA_HORA', y='PREÇO', title='Evolução do Preço Médio', markers=True, template=custom_template)
 
-    # CORREÇÃO 2: Garante que o retorno principal também tenha 8 elementos, incluindo as opções dos filtros.
     return (f"R$ {preco_medio:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."),
             f"{len(dff):,}".replace(",", "."), f"{dff['LOCADORA'].nunique()}",
             fig_preco_loc, fig_dist_cat, fig_preco_tmp,
@@ -1388,18 +1445,22 @@ clientside_callback(
     """
     function(n_in, n_out, n_reset, page_style, s_geral, s_comp, s_dash, s_pos_l, s_pos_c, s_mov_h) {
         const ctx = dash_clientside.callback_context;
-        if (!ctx.triggered.length) return [dash_clientside.no_update, ...Array(6).fill(dash_clientside.no_update)];
+        if (!ctx.triggered.length || !ctx.triggered[0].prop_id) return [dash_clientside.no_update, ...Array(7).fill(dash_clientside.no_update)];
 
         const button_id = ctx.triggered[0]['prop_id'].split('.')[0];
-        let new_page_style = {...(page_style || {})};
+
+        // This callback should only fire when a user is logged in and the page-content exists
+        if (!page_style) return [dash_clientside.no_update, ...Array(7).fill(dash_clientside.no_update)];
+
+        let new_page_style = {...page_style};
 
         const transform_str = new_page_style.transform || 'scale(1.0)';
         const scale_match = transform_str.match(/scale\\(([^)]+)\\)/);
-        let current_scale = scale_match ? parseFloat(scale_match[1]) : 1.0;
+        let current_scale = scale_match ? parseFloat(scale_match[1]) : 0.8;
 
         if (button_id === 'zoom-in-btn') current_scale += 0.1;
         else if (button_id === 'zoom-out-btn') current_scale -= 0.1;
-        else if (button_id === 'zoom-reset-btn') current_scale = 1.0;
+        else if (button_id === 'zoom-reset-btn') current_scale = 0.8; // Reset para o valor inicial
 
         current_scale = Math.max(0.5, Math.min(2.0, current_scale));
         new_page_style.transform = `scale(${current_scale.toFixed(2)})`;
@@ -1408,7 +1469,7 @@ clientside_callback(
         const new_width = `${((1 / current_scale) * 100).toFixed(2)}%`;
 
         const update_style = (style_obj) => {
-            if (style_obj && style_obj.display !== 'none') {
+            if (style_obj && typeof style_obj.display !== 'undefined' && style_obj.display !== 'none') {
                 let new_style = {...style_obj};
                 new_style.width = new_width;
                 return new_style;
@@ -1438,3 +1499,7 @@ clientside_callback(
     State('scrollable-container-mov-horario', 'style'),
     prevent_initial_call=True
 )
+
+
+if __name__ == '__main__':
+    app.run_server(debug=True)
