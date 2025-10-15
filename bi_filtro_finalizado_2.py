@@ -14,45 +14,88 @@ from datetime import datetime
 import plotly.graph_objects as go
 import flask  # Para obter o IP do usuário
 import requests  # Para geolocalização
+from dotenv import load_dotenv  # <-- ADICIONE ESTA LINHA
+load_dotenv()                   # <-- ADICIONE ESTA LINHA
 
 # --- MÓDULOS DE AUTENTICAÇÃO E BANCO DE DADOS ---
-import sqlite3
+import psycopg2 # pyright: ignore[reportMissingModuleSource]
+import psycopg2.extras # pyright: ignore[reportMissingModuleSource]
 from werkzeug.security import generate_password_hash, check_password_hash
 
 # ==============================================================================
 # CONFIGURAÇÕES DE AUTENTICAÇÃO
 # ==============================================================================
-DB_FILE = 'users_logs.db'
+# Pega a URL do banco de dados das variáveis de ambiente do Render
+DATABASE_URL = os.environ.get('DATABASE_URL')
 ADMIN_USERS = ['tgr', 'lfdl']
 NORMAL_USERS = ['hmc', 'hes', 'jbg', 'anln', 'tcj', 'cmf', 'mss']
 ALL_PREDEFINED_USERS = ADMIN_USERS + NORMAL_USERS
 
 # ==============================================================================
-# FUNÇÕES DO BANCO DE DADOS
+# FUNÇÕES DO BANCO DE DADOS (VERSÃO POSTGRESQL)
 # ==============================================================================
+def get_db_connection():
+    """Cria e retorna uma conexão com o banco de dados PostgreSQL."""
+    if not DATABASE_URL:
+        raise ValueError("A variável de ambiente DATABASE_URL não foi configurada.")
+    conn = psycopg2.connect(DATABASE_URL)
+    return conn
+
+def initialize_database():
+    """Cria as tabelas se não existirem no PostgreSQL."""
+    print("Verificando e inicializando banco de dados PostgreSQL...")
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT,
+            role TEXT NOT NULL
+        )
+    ''')
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS access_logs (
+            id SERIAL PRIMARY KEY,
+            timestamp TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+            username TEXT NOT NULL,
+            ip_address TEXT,
+            location TEXT
+        )
+    ''')
+    # Insere usuários se eles ainda não existirem, usando a sintaxe do PostgreSQL
+    for user in ADMIN_USERS + NORMAL_USERS:
+        role = 'admin' if user in ADMIN_USERS else 'user'
+        cur.execute("INSERT INTO users (username, role) VALUES (%s, %s) ON CONFLICT (username) DO NOTHING", (user, role))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+    print("Banco de dados PostgreSQL inicializado/verificado com sucesso.")
+
 def get_user(username):
-    """Busca um usuário no banco de dados."""
-    db_path = os.path.join(os.path.dirname(__file__), DB_FILE)
-    if not os.path.exists(db_path):
-        print(f"ERRO: Arquivo de banco de dados '{DB_FILE}' não encontrado.")
-        return None
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    user = conn.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
+    """Busca um usuário no banco de dados PostgreSQL."""
+    conn = get_db_connection()
+    # Usar DictCursor para retornar resultados como dicionários (ex: user['password_hash'])
+    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    cur.execute('SELECT * FROM users WHERE username = %s', (username,))
+    user = cur.fetchone()
+    cur.close()
     conn.close()
     return user
 
 def update_user_password(username, password):
-    """Atualiza a senha de um usuário (gerando hash)."""
+    """Atualiza a senha de um usuário no PostgreSQL."""
     password_hash = generate_password_hash(password)
-    db_path = os.path.join(os.path.dirname(__file__), DB_FILE)
-    conn = sqlite3.connect(db_path)
-    conn.execute('UPDATE users SET password_hash = ? WHERE username = ?', (password_hash, username))
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('UPDATE users SET password_hash = %s WHERE username = %s', (password_hash, username))
     conn.commit()
+    cur.close()
     conn.close()
 
 def log_access(username):
-    """Registra um evento de login no banco de dados."""
+    """Registra um evento de login no PostgreSQL."""
     try:
         ip_address = flask.request.headers.get('X-Forwarded-For', flask.request.remote_addr)
         response = requests.get(f'http://ip-api.com/json/{ip_address}?fields=city,regionName,country', timeout=2)
@@ -68,17 +111,17 @@ def log_access(username):
         ip_address = "localhost"
         location = "Local"
 
-    db_path = os.path.join(os.path.dirname(__file__), DB_FILE)
-    conn = sqlite3.connect(db_path)
-    conn.execute('INSERT INTO access_logs (username, ip_address, location) VALUES (?, ?, ?)',
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('INSERT INTO access_logs (username, ip_address, location) VALUES (%s, %s, %s)',
                  (username, ip_address, location))
     conn.commit()
+    cur.close()
     conn.close()
 
 def get_all_logs():
-    """Busca todos os registros de logs de acesso."""
-    db_path = os.path.join(os.path.dirname(__file__), DB_FILE)
-    conn = sqlite3.connect(db_path)
+    """Busca todos os registros de logs de acesso do PostgreSQL."""
+    conn = get_db_connection()
     query = """
     SELECT
         timestamp AS "HORA DO ACESSO",
@@ -648,6 +691,12 @@ layout_movimentacao_horario = dbc.Container([
     html.Div(id='scrollable-container-mov-horario', style={'display': 'none'}), # ID Único
     html.P("by Tiago Garcéa e Felipe ", style={"color": "gray", "font-size": "9pt", "margin-top": "20px"})
 ], fluid=True)
+
+# ==============================================================================
+# INICIALIZAÇÃO DO BANCO DE DADOS EXTERNO
+# ==============================================================================
+if DATABASE_URL:
+    initialize_database()
 
 # --- LAYOUT PRINCIPAL DO APP (MODIFICADO) ---
 app.layout = html.Div([
