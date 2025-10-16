@@ -1551,4 +1551,5 @@ clientside_callback(
 
 
 if __name__ == '__main__':
-    app.run_server(debug=True)
+    # A porta 7860 é a padrão que o Hugging Face espera.
+    app.run_server(debug=False, host='0.0.0.0', port=7860)
